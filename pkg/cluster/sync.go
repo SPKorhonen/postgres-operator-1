@@ -621,6 +621,21 @@ func (c *Cluster) syncSecrets() error {
 	c.setProcessName("syncing secrets")
 	secrets := c.generateUserSecrets()
 
+	err = c.initDbConn()
+	if err != nil {
+		return fmt.Errorf("could not init db connection: %v", err)
+	}
+
+	defer func() {
+		if err2 := c.closeDbConn(); err2 != nil {
+			if err == nil {
+				err = fmt.Errorf("could not close database connection: %v", err2)
+			} else {
+				err = fmt.Errorf("could not close database connection: %v (prior error: %v)", err2, err)
+			}
+		}
+	}()
+
 	for secretUsername, secretSpec := range secrets {
 		if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Create(context.TODO(), secretSpec, metav1.CreateOptions{}); err == nil {
 			c.Secrets[secret.UID] = secret
