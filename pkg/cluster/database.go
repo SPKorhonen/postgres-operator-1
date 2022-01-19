@@ -14,34 +14,11 @@ import (
 	"github.com/zalando/postgres-operator/pkg/spec"
 	"github.com/zalando/postgres-operator/pkg/util/constants"
 	"github.com/zalando/postgres-operator/pkg/util/retryutil"
+	"github.com/zalando/postgres-operator/pkg/util/users"
 )
 
 const (
-	getUserSQL = `WITH dbowners AS (
-		SELECT DISTINCT pg_catalog.pg_get_userbyid(datdba) AS owner
-		  FROM pg_database
-		 WHERE datname NOT IN ('postgres', 'template0', 'template1')
-	  ), roles AS (
-		SELECT a.rolname, COALESCE(a.rolpassword, '') AS rolpassword, a.rolsuper, a.rolinherit,
-			   a.rolcreaterole, a.rolcreatedb, a.rolcanlogin, s.setconfig,
-			   ARRAY(SELECT b.rolname
-					   FROM pg_catalog.pg_auth_members m
-					   JOIN pg_catalog.pg_authid b ON (m.roleid = b.oid)
-					  WHERE m.member = a.oid) as memberof
-		  FROM pg_catalog.pg_authid a
-		  LEFT JOIN pg_catalog.pg_db_role_setting s ON (a.oid = s.setrole AND s.setdatabase = 0::oid)
-		 WHERE a.rolname = ANY($1)
-		 ORDER BY 1
-	  )
-	  SELECT r.rolname, r.rolpassword, r.rolsuper, r.rolinherit,
-			 r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.setconfig,
-			 r.memberof,
-			 o.owner IS NOT NULL OR r.rolname LIKE '%_owner' AS is_owner
-		FROM roles r
-		LEFT JOIN dbowners o ON o.owner = r.rolname OR o.owner = ANY (r.memberof)
-	   ORDER BY 1;`
-
-	/*`SELECT a.rolname, COALESCE(a.rolpassword, ''), a.rolsuper, a.rolinherit,
+	getUserSQL = `SELECT a.rolname, COALESCE(a.rolpassword, ''), a.rolsuper, a.rolinherit,
 	       a.rolcreaterole, a.rolcreatedb, a.rolcanlogin, s.setconfig,
 	       ARRAY(SELECT b.rolname
 	             FROM pg_catalog.pg_auth_members m
@@ -49,7 +26,13 @@ const (
 	            WHERE m.member = a.oid) as memberof
 	FROM pg_catalog.pg_authid a LEFT JOIN pg_db_role_setting s ON (a.oid = s.setrole AND s.setdatabase = 0::oid)
 	WHERE a.rolname = ANY($1)
-	ORDER BY 1;`*/
+	ORDER BY 1;`
+
+	getUsersForRetention = `SELECT r.rolname, right(u.name, 6) AS roldatesuffix
+	        FROM pg_roles r
+	        JOIN unnest($1) AS u(name)
+			WHERE u.name LIKE r.rolname || '%'
+			AND right(u.name, 6) ~ '^[0-9\.]+$';`
 
 	getDatabasesSQL = `SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database;`
 	getSchemasSQL   = `SELECT n.nspname AS dbschema FROM pg_catalog.pg_namespace n
@@ -222,10 +205,10 @@ func (c *Cluster) readPgUsersFromDatabase(userNames []string) (users spec.PgUser
 			rolname, rolpassword                                          string
 			rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin bool
 			roloptions, memberof                                          []string
-			rolowner, roldeleted                                          bool
+			roldeleted                                                    bool
 		)
 		err := rows.Scan(&rolname, &rolpassword, &rolsuper, &rolinherit,
-			&rolcreaterole, &rolcreatedb, &rolcanlogin, pq.Array(&roloptions), pq.Array(&memberof), &rolowner)
+			&rolcreaterole, &rolcreatedb, &rolcanlogin, pq.Array(&roloptions), pq.Array(&memberof))
 		if err != nil {
 			return nil, fmt.Errorf("error when processing user rows: %v", err)
 		}
@@ -245,10 +228,50 @@ func (c *Cluster) readPgUsersFromDatabase(userNames []string) (users spec.PgUser
 			roldeleted = true
 		}
 
-		users[rolname] = spec.PgUser{Name: rolname, Password: rolpassword, Flags: flags, MemberOf: memberof, Parameters: parameters, IsDbOwner: rolowner, Deleted: roldeleted}
+		users[rolname] = spec.PgUser{Name: rolname, Password: rolpassword, Flags: flags, MemberOf: memberof, Parameters: parameters, Deleted: roldeleted}
 	}
 
 	return users, nil
+}
+
+func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
+	c.setProcessName("checking for rotated users to remove from the database due to configured retention")
+	rows, err := db.Query(getUsersForRetention, pq.Array(rotatedUsers))
+	if err != nil {
+		return fmt.Errorf("error when querying for deprecated users from password rotation: %v", err)
+	}
+	defer func() {
+		if err2 := rows.Close(); err2 != nil {
+			err = fmt.Errorf("error when closing query cursor: %v", err2)
+		}
+	}()
+
+	for rows.Next() {
+		var (
+			rolname, roldatesuffix string
+		)
+		err := rows.Scan(&rolname, &roldatesuffix)
+		if err != nil {
+			return fmt.Errorf("error when processing rows of deprecated users: %v", err)
+		}
+		// make sure user retention policy aligns with rotation interval
+		retenionDays := c.OpConfig.PasswordRotationUserRetention
+		if retenionDays < 2*c.OpConfig.PasswordRotationInterval {
+			retenionDays = 2 * c.OpConfig.PasswordRotationInterval
+			c.logger.Warnf("user retention days too few compared to rotation interval %d - setting it to %d", c.OpConfig.PasswordRotationInterval, retenionDays)
+		}
+		retentionDate := time.Now().AddDate(0, 0, int(retenionDays)*-1)
+		userCreationDate, err := time.Parse("060102", roldatesuffix)
+		if err != nil {
+			return fmt.Errorf("could not parse creation date suffix of user %q: %v", rolname, err)
+		}
+		if retentionDate.After(userCreationDate) {
+			c.logger.Infof("Dropping user %q due to configured days in password_rotation_user_retention", rolname)
+			users.DropPgUser(rolname, db)
+		}
+	}
+
+	return nil
 }
 
 // getDatabases returns the map of current databases with owners
