@@ -28,11 +28,11 @@ const (
 	WHERE a.rolname = ANY($1)
 	ORDER BY 1;`
 
-	getUsersForRetention = `SELECT r.rolname, right(u.name, 6) AS roldatesuffix
+	getUsersForRetention = `SELECT r.rolname, right(r.rolname, 6) AS roldatesuffix
 	        FROM pg_roles r
-	        JOIN unnest($1) AS u(name)
-			WHERE u.name LIKE r.rolname || '%'
-			AND right(u.name, 6) ~ '^[0-9\.]+$';`
+	        JOIN unnest($1::text[]) AS u(name) ON r.rolname LIKE u.name || '%'
+			AND right(r.rolname, 6) ~ '^[0-9\.]+$'
+			ORDER BY 1;`
 
 	getDatabasesSQL = `SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database;`
 	getSchemasSQL   = `SELECT n.nspname AS dbschema FROM pg_catalog.pg_namespace n
@@ -234,11 +234,11 @@ func (c *Cluster) readPgUsersFromDatabase(userNames []string) (users spec.PgUser
 	return users, nil
 }
 
-func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
-	c.setProcessName("checking for rotated users to remove from the database due to configured retention")
+func findUsersFromRotation(rotatedUsers []string, db *sql.DB) (map[string]string, error) {
+	extraUsers := make(map[string]string, 0)
 	rows, err := db.Query(getUsersForRetention, pq.Array(rotatedUsers))
 	if err != nil {
-		return fmt.Errorf("error when querying for deprecated users from password rotation: %v", err)
+		return nil, fmt.Errorf("query failed: %v", err)
 	}
 	defer func() {
 		if err2 := rows.Close(); err2 != nil {
@@ -252,8 +252,22 @@ func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
 		)
 		err := rows.Scan(&rolname, &roldatesuffix)
 		if err != nil {
-			return fmt.Errorf("error when processing rows of deprecated users: %v", err)
+			return nil, fmt.Errorf("error when processing rows of deprecated users: %v", err)
 		}
+		extraUsers[rolname] = roldatesuffix
+	}
+
+	return extraUsers, nil
+}
+
+func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
+	c.setProcessName("checking for rotated users to remove from the database due to configured retention")
+	extraUsers, err := findUsersFromRotation(rotatedUsers, db)
+	if err != nil {
+		return fmt.Errorf("error when querying for deprecated users from password rotation: %v", err)
+	}
+
+	for rotatedUser, dateSuffix := range extraUsers {
 		// make sure user retention policy aligns with rotation interval
 		retenionDays := c.OpConfig.PasswordRotationUserRetention
 		if retenionDays < 2*c.OpConfig.PasswordRotationInterval {
@@ -261,13 +275,17 @@ func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
 			c.logger.Warnf("user retention days too few compared to rotation interval %d - setting it to %d", c.OpConfig.PasswordRotationInterval, retenionDays)
 		}
 		retentionDate := time.Now().AddDate(0, 0, int(retenionDays)*-1)
-		userCreationDate, err := time.Parse("060102", roldatesuffix)
+		userCreationDate, err := time.Parse("060102", dateSuffix)
 		if err != nil {
-			return fmt.Errorf("could not parse creation date suffix of user %q: %v", rolname, err)
+			c.logger.Errorf("could not parse creation date suffix of user %q: %v", rotatedUser, err)
+			continue
 		}
 		if retentionDate.After(userCreationDate) {
-			c.logger.Infof("Dropping user %q due to configured days in password_rotation_user_retention", rolname)
-			users.DropPgUser(rolname, db)
+			c.logger.Infof("dropping user %q due to configured days in password_rotation_user_retention", rotatedUser)
+			if err = users.DropPgUser(rotatedUser, db); err != nil {
+				c.logger.Errorf("could not drop role %q: %v", rotatedUser, err)
+				continue
+			}
 		}
 	}
 
